@@ -5,6 +5,8 @@
 #include<string.h>
 #include<unistd.h> // for close
 #include<arpa/inet.h> // for inet_ntop()
+#include<sys/types.h>
+#include<sys/socket.h>
 
 #define PORT 6969
 #define SAFE_MODE 1
@@ -159,7 +161,15 @@ void *server_thread(void *arg)
           client.strike_count = 0;
           client.addr = msg.addr;
           add_client(&client);
+        } else {
+          double remaining = BAN_LIMIT - difftime(now, banned_at);
+          char buffer[128];
+          snprintf(buffer, sizeof(buffer), "You are banned MF: %f secs left\n", remaining);
+
+          send(msg.conn_fd, buffer, strlen(buffer), 0);
+          close(msg.conn_fd);
         }
+        break;
       }
     }
   }
