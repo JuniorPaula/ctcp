@@ -2,7 +2,10 @@
 #include<netinet/in.h>
 #include<pthread.h>
 #include<stdlib.h>
+#include<string.h>
+#include<unistd.h> // for close
 
+#define PORT 6969
 #define BUFFER_SIZE 64
 #define MAX_MESSAGES 100
 
@@ -49,5 +52,54 @@ int main()
     exit(EXIT_FAILURE);
   }
 
+  // set socket options to reuse address
+  int opt = 1;
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  // bind socket
+  memset(&serv_addr, 0, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_addr.s_addr = INADDR_ANY;
+  serv_addr.sin_port = htons(PORT);
+
+  if (bind(listen_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    perror("bind");
+    close(listen_fd);
+    exit(EXIT_FAILURE);
+  }
+
+  // listen
+  if (listen(listen_fd, 10) < 0) {
+    perror("listen");
+    close(listen_fd);
+    exit(EXIT_FAILURE);
+  }
+
+  printf("Listeing to TCP connections on port %d ...\n", PORT);
+
 	return 0;
 }
+
+void init_message_queue(MessageQueue *queue)
+{
+  queue->start = 0;
+  queue->end = 0;
+  pthread_mutex_init(&queue->mutex, NULL);
+  pthread_cond_init(&queue->cond, NULL);
+}
+
+void *server_thread(void *arg)
+{
+  MessageQueue *queue = (MessageQueue *)arg;
+  printf("%d", queue->start);
+}
+
+
+
+
+
+
+
+
+
+
