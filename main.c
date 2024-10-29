@@ -66,6 +66,7 @@ int is_ip_banned(const char *ip, time_t *banned_at);
 void remove_banned_ip(const char *ip);
 const char *sensitive(const char *message);
 void add_client(Client *client);
+void remove_client(int conn_fd);
 void *server_thread(void *arg);
 
 int main()
@@ -171,6 +172,13 @@ void *server_thread(void *arg)
         }
         break;
       }
+      case CLIENT_DISCONNECTED: {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(msg.addr.sin_addr), ip, INET_ADDRSTRLEN);
+        printf("Client %s disconnected\n", sensitive(ip));
+        remove_client(msg.conn_fd);
+        break;
+      }
     }
   }
 }
@@ -186,6 +194,28 @@ void add_client(Client *client)
   node->client = *client;
   node->next = clients_head;
   clients_head = node;
+  pthread_mutex_unlock(&clients_mutex);
+}
+
+void remove_client(int conn_fd)
+{
+  pthread_mutex_lock(&clients_mutex);
+  ClientNode *prev = NULL;
+  ClientNode *curr = clients_head;
+  while(curr != NULL) {
+    if (curr->client.conn_fd == conn_fd) {
+      if (prev == NULL) {
+        clients_head = curr->next;
+      } else {
+        prev->next = curr->next;
+      }
+      close(curr->client.conn_fd);
+      free(curr);
+      break;
+    }
+    prev = curr;
+    curr = curr->next;
+  }
   pthread_mutex_unlock(&clients_mutex);
 }
 
