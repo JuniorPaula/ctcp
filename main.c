@@ -7,6 +7,7 @@
 #include<arpa/inet.h> // for inet_ntop()
 
 #define PORT 6969
+#define SAFE_MODE 1
 #define BUFFER_SIZE 64
 #define MAX_MESSAGES 100
 #define BAN_LIMIT 600.0
@@ -24,6 +25,18 @@ typedef struct {
 	struct sockaddr_in addr;
 } Message;
 
+typedef struct Client {
+  int conn_fd;
+  time_t last_message_time;
+  int strike_count;
+  struct sockaddr_in addr;
+} Client;
+
+typedef struct ClientNode {
+  Client client;
+  struct ClientNode *next;
+} ClientNode;
+
 typedef struct BannedIP {
   char ip[INET_ADDRSTRLEN];
   time_t banned_at;
@@ -38,14 +51,19 @@ typedef struct {
 	pthread_cond_t cond;
 } MessageQueue;
 
+// Global variables
 MessageQueue message_queue;
+ClientNode *clients_head = NULL;
 BannedIP *banned_ips_head = NULL;
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t banned_ips_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void init_message_queue(MessageQueue *queue);
 int dequeue_message(MessageQueue *queue, Message *message);
 int is_ip_banned(const char *ip, time_t *banned_at);
 void remove_banned_ip(const char *ip);
+const char *sensitive(const char *message);
+void add_client(Client *client);
 void *server_thread(void *arg);
 
 int main()
@@ -101,6 +119,15 @@ void init_message_queue(MessageQueue *queue)
   pthread_cond_init(&queue->cond, NULL);
 }
 
+const char *sensitive(const char *message)
+{
+  if (SAFE_MODE) {
+    return "[REDACTED]";
+  } else {
+    return message;
+  }
+}
+
 void *server_thread(void *arg)
 {
   MessageQueue *queue = (MessageQueue *)arg;
@@ -123,9 +150,33 @@ void *server_thread(void *arg)
             is_banned = 0;
           }
         }
+
+        if (!is_banned) {
+          printf("Client %s connected\n", sensitive(ip));
+          Client client;
+          client.conn_fd = msg.conn_fd;
+          client.last_message_time = now;
+          client.strike_count = 0;
+          client.addr = msg.addr;
+          add_client(&client);
+        }
       }
     }
   }
+}
+
+void add_client(Client *client)
+{
+  pthread_mutex_lock(&clients_mutex);
+  ClientNode *node = (ClientNode *)malloc(sizeof(ClientNode));
+  if (node == NULL) {
+    perror("malloc");
+    exit(EXIT_FAILURE);
+  }
+  node->client = *client;
+  node->next = clients_head;
+  clients_head = node;
+  pthread_mutex_unlock(&clients_mutex);
 }
 
 int dequeue_message(MessageQueue *queue, Message *message)
