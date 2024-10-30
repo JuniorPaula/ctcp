@@ -7,12 +7,15 @@
 #include<arpa/inet.h> // for inet_ntop()
 #include<sys/types.h>
 #include<sys/socket.h>
+#include<errno.h>
 
 #define PORT 6969
 #define SAFE_MODE 1
 #define BUFFER_SIZE 64
 #define MAX_MESSAGES 100
 #define BAN_LIMIT 600.0
+#define MESSAGE_RATE 1.0
+#define STRIKE_LIMIT 10
 
 typedef enum {
 	CLIENT_CONNECTED = 1,
@@ -61,13 +64,17 @@ pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t banned_ips_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void init_message_queue(MessageQueue *queue);
+void enqueue_message(MessageQueue *queue, Message *message);
 int dequeue_message(MessageQueue *queue, Message *message);
 int is_ip_banned(const char *ip, time_t *banned_at);
 void remove_banned_ip(const char *ip);
 const char *sensitive(const char *message);
+Client *find_client(int conn_fd);
+void add_banned_ip(const char *ip, time_t banned_at);
 void add_client(Client *client);
 void remove_client(int conn_fd);
 void *server_thread(void *arg);
+void *client_thread(void *arg);
 
 int main()
 {
@@ -111,6 +118,40 @@ int main()
 
   printf("Listeing to TCP connections on port %d ...\n", PORT);
 
+  while(1) {
+    struct sockaddr_in cli_addr;
+    socklen_t cli_len = sizeof(cli_addr);
+    int *conn_fd_ptr = malloc(sizeof(int));
+    if (conn_fd_ptr == NULL) {
+      perror("maloc");
+      continue;
+    }
+
+    *conn_fd_ptr = accept(listen_fd, (struct sockaddr *)&cli_addr, &cli_len);
+    if (*conn_fd_ptr < 0) {
+      perror("accept");
+      free(conn_fd_ptr);
+      continue;
+    }
+
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(cli_addr.sin_addr), ip, INET_ADDRSTRLEN);
+    printf("Accepted connection from %s\n", sensitive(ip));
+
+    // send client connected message to server
+    Message msg;
+    msg.type = CLIENT_CONNECTED;
+    msg.conn_fd = *conn_fd_ptr;
+    msg.addr = cli_addr;
+    enqueue_message(&message_queue, &msg);
+
+    // start client thread
+    pthread_t client_tid;
+    pthread_create(&client_tid, NULL, client_thread, conn_fd_ptr);
+    pthread_detach(client_tid); // detach thread to avoid memory leek
+  }
+
+  close(listen_fd);
 	return 0;
 }
 
@@ -179,8 +220,105 @@ void *server_thread(void *arg)
         remove_client(msg.conn_fd);
         break;
       }
+      case NEW_MESSAGE: {
+        Client *author = find_client(msg.conn_fd);
+        time_t now = time(NULL);
+        if (author != NULL) {
+          double seconds_since_last_message = difftime(now, author->last_message_time);
+
+          if (seconds_since_last_message >= MESSAGE_RATE) {
+            author->last_message_time = now;
+            author->strike_count = 0;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(author->addr.sin_addr), ip, INET_ADDRSTRLEN);
+            printf("Client %s sent message %s", sensitive(ip), msg.text);
+
+            // forward message to other clients
+            pthread_mutex_lock(&clients_mutex);
+            ClientNode *curr = clients_head;
+            while(curr != NULL) {
+              if (curr->client.conn_fd != msg.conn_fd) {
+                int n = send(curr->client.conn_fd, msg.text, strlen(msg.text), 0);
+                if (n < 0) {
+                  printf("Cloud not send data to %s: %s\n", sensitive(ip), strerror(errno));
+                }
+              }
+              curr = curr->next;
+            }
+            pthread_mutex_unlock(&clients_mutex);
+          } else {
+            author->strike_count++;
+            if (author->strike_count >= STRIKE_LIMIT) {
+              char ip[INET_ADDRSTRLEN];
+              inet_ntop(AF_INET, &(author->addr.sin_addr), ip, INET_ADDRSTRLEN);
+              add_banned_ip(ip, now);
+              send(author->conn_fd, "You are banned\n", 16, 0);
+              close(author->conn_fd);
+              remove_client(author->conn_fd);
+            }
+          }
+        } else {
+          // close connection
+          close(msg.conn_fd);
+        }
+        break;
+      }
+      default:
+        break;
     }
   }
+  return NULL;
+}
+
+void *client_thread(void *arg)
+{
+  int conn_fd = *(int *)arg;
+  free(arg);
+  char buffer[BUFFER_SIZE];
+
+  while(1) {
+    int n = recv(conn_fd, buffer, BUFFER_SIZE, 0);
+    if (n <= 0) {
+      if (n < 0) {
+        perror("recv");
+      }
+      // send client disconnected message to server
+      Message msg;
+      msg.type = CLIENT_DISCONNECTED;
+      msg.conn_fd = conn_fd;
+      // get client's addr
+      Client *client = find_client(conn_fd);
+      if (client != NULL) {
+        msg.addr = client->addr;
+      }
+      enqueue_message(&message_queue, &msg);
+      break;
+    }
+    buffer[n] = '\0';
+    // sen new message to server
+    Message msg;
+    msg.type = NEW_MESSAGE;
+    msg.conn_fd = conn_fd;
+    strncpy(msg.text, buffer, BUFFER_SIZE);
+    enqueue_message(&message_queue, &msg);
+  }
+
+  return NULL;
+}
+
+Client *find_client(int conn_fd)
+{
+  pthread_mutex_lock(&clients_mutex);
+  ClientNode *curr = clients_head;
+  while(curr != NULL) {
+    if (curr->client.conn_fd == conn_fd) {
+      pthread_mutex_unlock(&clients_mutex);
+      return &curr->client;
+    }
+    curr = curr->next;
+  }
+  pthread_mutex_unlock(&clients_mutex);
+  return NULL;
 }
 
 void add_client(Client *client)
@@ -219,6 +357,21 @@ void remove_client(int conn_fd)
   pthread_mutex_unlock(&clients_mutex);
 }
 
+void enqueue_message(MessageQueue *queue, Message *message)
+{
+  pthread_mutex_lock(&queue->mutex);
+  int next_end = (queue->end + 1) % MAX_MESSAGES;
+  if (next_end == queue->start) {
+    // queue is full, drop the message
+    printf("Message queue is full, dropping message\n");
+  } else {
+    queue->messages[queue->end] = *message;
+    queue->end = next_end;
+    pthread_cond_signal(&queue->cond);
+  }
+  pthread_mutex_unlock(&queue->mutex);
+}
+
 int dequeue_message(MessageQueue *queue, Message *message)
 {
   pthread_mutex_lock(&queue->mutex);
@@ -246,6 +399,21 @@ int is_ip_banned(const char *ip, time_t *banned_at)
   }
   pthread_mutex_unlock(&banned_ips_mutex);
   return 0;
+}
+
+void add_banned_ip(const char *ip, time_t banned_at)
+{
+  pthread_mutex_lock(&banned_ips_mutex);
+  BannedIP *node = (BannedIP *)malloc(sizeof(BannedIP));
+  if (node == NULL) {
+    perror("malloc");
+    exit(EXIT_FAILURE);
+  }
+  strncpy(node->ip, ip, INET_ADDRSTRLEN);
+  node->banned_at = banned_at;
+  node->next = banned_ips_head;
+  banned_ips_head = node;
+  pthread_mutex_unlock(&banned_ips_mutex);
 }
 
 void remove_banned_ip(const char *ip)
