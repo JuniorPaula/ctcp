@@ -8,9 +8,10 @@
 #include<sys/types.h>
 #include<sys/socket.h>
 #include<errno.h>
+#include<stdarg.h>
 
 #define PORT 6969
-#define SAFE_MODE 1
+#define SAFE_MODE 0
 #define BUFFER_SIZE 64
 #define MAX_MESSAGES 100
 #define BAN_LIMIT 600.0
@@ -62,6 +63,7 @@ ClientNode *clients_head = NULL;
 BannedIP *banned_ips_head = NULL;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t banned_ips_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void init_message_queue(MessageQueue *queue);
 void enqueue_message(MessageQueue *queue, Message *message);
@@ -75,9 +77,18 @@ void add_client(Client *client);
 void remove_client(int conn_fd);
 void *server_thread(void *arg);
 void *client_thread(void *arg);
+void write_log(const char *format, ...);
+
+FILE *log_file;
 
 int main()
 {
+  log_file = fopen("chat_log.txt", "a");
+  if (log_file == NULL) {
+    perror("could not open file log\n");
+    exit(EXIT_FAILURE);
+  }
+
 	int listen_fd;
 	struct sockaddr_in serv_addr;
 
@@ -151,7 +162,9 @@ int main()
     pthread_detach(client_tid); // detach thread to avoid memory leek
   }
 
+  fclose(log_file);
   close(listen_fd);
+
 	return 0;
 }
 
@@ -197,6 +210,12 @@ void *server_thread(void *arg)
 
         if (!is_banned) {
           printf("Client %s connected\n", sensitive(ip));
+
+          pthread_mutex_lock(&log_mutex);
+          fprintf(log_file, "Client %s connected\n", sensitive(ip));
+          fflush(log_file);
+          pthread_mutex_unlock(&log_mutex);
+
           Client client;
           client.conn_fd = msg.conn_fd;
           client.last_message_time = now;
@@ -217,6 +236,9 @@ void *server_thread(void *arg)
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(msg.addr.sin_addr), ip, INET_ADDRSTRLEN);
         printf("Client %s disconnected\n", sensitive(ip));
+
+        write_log("Client %s disconnected\n", sensitive(ip));
+          
         remove_client(msg.conn_fd);
         break;
       }
@@ -231,7 +253,9 @@ void *server_thread(void *arg)
             author->strike_count = 0;
             char ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &(author->addr.sin_addr), ip, INET_ADDRSTRLEN);
-            printf("Client %s sent message %s", sensitive(ip), msg.text);
+            printf("Client %s sent message: %s", sensitive(ip), msg.text);
+
+            write_log("Client %s sent message: %s", sensitive(ip), msg.text);
 
             // forward message to other clients
             pthread_mutex_lock(&clients_mutex);
@@ -251,6 +275,9 @@ void *server_thread(void *arg)
             if (author->strike_count >= STRIKE_LIMIT) {
               char ip[INET_ADDRSTRLEN];
               inet_ntop(AF_INET, &(author->addr.sin_addr), ip, INET_ADDRSTRLEN);
+
+              write_log("Client [%s] has been banned\n", sensitive(ip));
+
               add_banned_ip(ip, now);
               send(author->conn_fd, "You are banned\n", 16, 0);
               close(author->conn_fd);
@@ -435,4 +462,23 @@ void remove_banned_ip(const char *ip)
     curr = curr->next;
   }
   pthread_mutex_unlock(&banned_ips_mutex);
+}
+
+void write_log(const char *format, ...)
+{
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  char time_str[20];
+  strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
+
+  pthread_mutex_lock(&log_mutex);
+  fprintf(log_file, "[%s] ", time_str);
+
+  va_list args;
+  va_start(args, format);
+  vfprintf(log_file, format, args);
+  va_end(args);
+
+  fflush(log_file);
+  pthread_mutex_unlock(&log_mutex);
 }
